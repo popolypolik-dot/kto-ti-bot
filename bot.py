@@ -1,11 +1,17 @@
 import asyncio
+import os
 import re
 import sqlite3
+import time
 import uuid
+from datetime import datetime
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart
-from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
+from aiogram.types import (
+    Message, ReplyKeyboardMarkup, KeyboardButton,
+    InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+)
 
 # =========================================================
 # НАСТРОЙКИ
@@ -103,6 +109,55 @@ CREATE TABLE IF NOT EXISTS chat_messages (
 """)
 db.commit()
 
+# Дополнительные таблицы для блокировок, оценок и жалоб.
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS blocked_users (
+    blocker_id INTEGER NOT NULL,
+    blocked_id INTEGER NOT NULL,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (blocker_id, blocked_id)
+)
+""")
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS ratings (
+    session_id TEXT NOT NULL,
+    rater_id INTEGER NOT NULL,
+    rated_id INTEGER NOT NULL,
+    rating INTEGER NOT NULL CHECK(rating BETWEEN 1 AND 5),
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (session_id, rater_id)
+)
+""")
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS reports (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    reporter_id INTEGER NOT NULL,
+    target_id INTEGER NOT NULL,
+    session_id TEXT,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+)
+""")
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS banned_users (
+    user_id INTEGER PRIMARY KEY,
+    reason TEXT,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+)
+""")
+db.commit()
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS bot_settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL DEFAULT ''
+)
+""")
+cursor.execute("INSERT OR IGNORE INTO bot_settings (key, value) VALUES ('maintenance', '0')")
+db.commit()
+
 # =========================================================
 # КЛАВИАТУРЫ
 # =========================================================
@@ -170,6 +225,7 @@ def menu_keyboard_for(user_id: int):
 
     rows.extend([
         [KeyboardButton(text="📊 Моя статистика")],
+        [KeyboardButton(text="🚫 Чёрный список")],
         [KeyboardButton(text="ℹ️ Помощь")],
         [KeyboardButton(text="🔙 Назад")],
     ])
@@ -194,8 +250,11 @@ contact_keyboard = ReplyKeyboardMarkup(
 
 admin_keyboard = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text="👁 Все активные диалоги")],
-        [KeyboardButton(text="🗂 Все сохранённые диалоги")],
+        [KeyboardButton(text="📊 Статистика бота"), KeyboardButton(text="👥 Пользователи")],
+        [KeyboardButton(text="🚨 Жалобы"), KeyboardButton(text="👁 Активные диалоги")],
+        [KeyboardButton(text="🗂 Сохранённые диалоги")],
+        [KeyboardButton(text="📢 Рассылка"), KeyboardButton(text="🔨 Бан / разбан")],
+        [KeyboardButton(text="💾 Бэкап сейчас"), KeyboardButton(text="⚙️ Режим техработ")],
         [KeyboardButton(text="🔙 Выйти из админки")]
     ],
     resize_keyboard=True
@@ -277,7 +336,7 @@ BAD_ROOTS = tuple(sorted({
     normalize_text(x) for x in [
         "бля", "бляд", "еб", "пизд", "хуй", "хуя", "хуе", "хуйн",
         "жоп", "ебан", "ебл", "ебат", "заеб", "доеб", "наеб", "выеб",
-        "уеб", "оху", "поху", "шлюх", "дроч", "гандон", "пидор",
+        "уеб", "оху", "шлюх", "дроч", "гандон", "пидор",
         "сучар", "манда"
     ]
 }))
@@ -310,6 +369,97 @@ def contains_bad_words(text: str) -> bool:
 
     # И варианты, где слово специально разбили символами/пробелами.
     return obfuscated_contains_bad_root(text)
+
+
+# =========================================================
+# ЗАЩИТА, АНТИСПАМ, БЛОКИРОВКИ
+# =========================================================
+
+message_rate = {}
+admin_broadcast_mode = set()
+
+
+def is_banned(user_id: int) -> bool:
+    cursor.execute("SELECT 1 FROM banned_users WHERE user_id = ?", (user_id,))
+    return cursor.fetchone() is not None
+
+
+def is_blocked(user_a: int, user_b: int) -> bool:
+    cursor.execute(
+        "SELECT 1 FROM blocked_users WHERE blocker_id = ? AND blocked_id = ?",
+        (user_a, user_b)
+    )
+    if cursor.fetchone():
+        return True
+    cursor.execute(
+        "SELECT 1 FROM blocked_users WHERE blocker_id = ? AND blocked_id = ?",
+        (user_b, user_a)
+    )
+    return cursor.fetchone() is not None
+
+
+def add_block(blocker_id: int, blocked_id: int):
+    cursor.execute(
+        "INSERT OR IGNORE INTO blocked_users (blocker_id, blocked_id) VALUES (?, ?)",
+        (blocker_id, blocked_id)
+    )
+    db.commit()
+
+
+def remove_block(blocker_id: int, blocked_id: int):
+    cursor.execute(
+        "DELETE FROM blocked_users WHERE blocker_id = ? AND blocked_id = ?",
+        (blocker_id, blocked_id)
+    )
+    db.commit()
+
+
+def get_blocked_users(user_id: int):
+    cursor.execute(
+        "SELECT blocked_id FROM blocked_users WHERE blocker_id = ? ORDER BY created_at DESC",
+        (user_id,)
+    )
+    return [row[0] for row in cursor.fetchall()]
+
+
+def anti_spam_ok(user_id: int) -> bool:
+    now = time.monotonic()
+    history = message_rate.setdefault(user_id, [])
+    history[:] = [t for t in history if now - t < 10]
+    if len(history) >= 8:
+        return False
+    history.append(now)
+    return True
+
+
+def rating_keyboard(session_id: str, partner_id: int):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⭐ 1", callback_data=f"rate|1|{session_id}|{partner_id}"),
+         InlineKeyboardButton(text="⭐ 2", callback_data=f"rate|2|{session_id}|{partner_id}"),
+         InlineKeyboardButton(text="⭐ 3", callback_data=f"rate|3|{session_id}|{partner_id}")],
+        [InlineKeyboardButton(text="⭐ 4", callback_data=f"rate|4|{session_id}|{partner_id}"),
+         InlineKeyboardButton(text="⭐ 5", callback_data=f"rate|5|{session_id}|{partner_id}")]
+    ])
+
+
+def blacklist_keyboard(blocked_ids):
+    rows = []
+    for uid in blocked_ids[:30]:
+        rows.append([InlineKeyboardButton(text=f"🔓 Разблокировать {uid}", callback_data=f"unblock|{uid}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
+
+
+async def send_rating_request(user_id: int, partner_id: int, session_id: str | None):
+    if not session_id or not partner_id:
+        return
+    try:
+        await bot.send_message(
+            user_id,
+            "⭐ Оцени собеседника от 1 до 5. Оценка анонимная.",
+            reply_markup=rating_keyboard(session_id, partner_id)
+        )
+    except Exception as e:
+        print("Не удалось отправить оценку пользователю:", e)
 
 
 # =========================================================
@@ -486,6 +636,7 @@ async def send_full_chat_to_admin(
                 from_chat_id=sender_id,
                 message_id=message_id
             )
+            await asyncio.sleep(0.08)
         except Exception as e:
             print(
                 f"Не удалось передать админу сообщение "
@@ -518,6 +669,28 @@ def filter_label(user_id: int) -> str:
 
 def is_admin(user_id: int) -> bool:
     return bool(ADMIN_ID) and user_id == ADMIN_ID
+
+
+def get_setting(key: str, default: str = "") -> str:
+    cursor.execute("SELECT value FROM bot_settings WHERE key = ?", (key,))
+    row = cursor.fetchone()
+    return row[0] if row else default
+
+
+def set_setting(key: str, value: str):
+    cursor.execute("INSERT OR REPLACE INTO bot_settings (key, value) VALUES (?, ?)", (key, value))
+    db.commit()
+
+
+def maintenance_enabled() -> bool:
+    return get_setting("maintenance", "0") == "1"
+
+
+def maintenance_message(user_id: int) -> str | None:
+    """Returns a maintenance message for regular users, or None for admin/normal mode."""
+    if maintenance_enabled() and not is_admin(user_id):
+        return "🛠 Бот временно находится на технических работах. Попробуй позже."
+    return None
 
 
 def get_active_sessions():
@@ -577,6 +750,7 @@ async def send_session_to_admin(session_id: str, title: str = "💬 Диалог
                 from_chat_id=sender_id,
                 message_id=message_id
             )
+            await asyncio.sleep(0.08)
         except Exception as e:
             await bot.send_message(
                 ADMIN_ID,
@@ -639,6 +813,11 @@ def my_profile_text(user_id: int) -> str:
 # =========================================================
 
 def compatible(user1, user2) -> bool:
+    if is_banned(user1[0]) or is_banned(user2[0]):
+        return False
+    if is_blocked(user1[0], user2[0]):
+        return False
+
     age1, age2 = user1[1], user2[1]
     gender1, gender2 = user1[2], user2[2]
     wanted1 = user1[10] or "🤷 Неважно"
@@ -648,11 +827,12 @@ def compatible(user1, user2) -> bool:
     if (age1 == "17 и младше") != (age2 == "17 и младше"):
         return False
 
-    # Желание пользователя должно совпадать с полом собеседника.
-    # "Неважно" подходит к любому полу.
-    if wanted1 != "🤷 Неважно" and wanted1 != gender2:
+    # Если пользователь указал свой пол как «Неважно», считаем его
+    # совместимым с любым полом собеседника. Это не ломает поиск,
+    # когда второй человек выбрал конкретный пол.
+    if wanted1 != "🤷 Неважно" and gender2 != "🤷 Неважно" and wanted1 != gender2:
         return False
-    if wanted2 != "🤷 Неважно" and wanted2 != gender1:
+    if wanted2 != "🤷 Неважно" and gender1 != "🤷 Неважно" and wanted2 != gender1:
         return False
 
     return True
@@ -663,7 +843,15 @@ def compatible(user1, user2) -> bool:
 
 async def find_partner(message: Message):
     user_id = message.from_user.id
+    maintenance_text = maintenance_message(user_id)
+    if maintenance_text:
+        await message.answer(maintenance_text)
+        return
     user = get_user(user_id)
+
+    if is_banned(user_id):
+        await message.answer("🚫 Доступ к боту ограничен.")
+        return
 
     if not user:
         create_user(user_id)
@@ -693,6 +881,7 @@ async def find_partner(message: Message):
         WHERE searching = 1
           AND user_id != ?
           AND partner_id IS NULL
+          AND user_id NOT IN (SELECT user_id FROM banned_users)
         ORDER BY user_id
     """, (user_id,))
 
@@ -759,6 +948,44 @@ async def find_partner(message: Message):
 # АДМИН-ПАНЕЛЬ
 # =========================================================
 
+@dp.message(F.text.startswith("/ban "))
+async def admin_ban(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    parts = message.text.split(maxsplit=2)
+    if len(parts) < 2 or not parts[1].isdigit():
+        await message.answer("Использование: /ban ID причина")
+        return
+    target = int(parts[1])
+    reason = parts[2] if len(parts) > 2 else "без причины"
+    if target == ADMIN_ID:
+        await message.answer("❌ Нельзя заблокировать самого администратора.")
+        return
+    cursor.execute(
+        "INSERT OR REPLACE INTO banned_users (user_id, reason) VALUES (?, ?)",
+        (target, reason)
+    )
+    db.commit()
+    target_user = get_user(target)
+    if target_user and target_user[4]:
+        await close_current_chat(target, "🚫 Ваш доступ к боту ограничен.")
+    await message.answer(f"🔨 Пользователь {target} заблокирован.\nПричина: {reason}")
+
+
+@dp.message(F.text.startswith("/unban "))
+async def admin_unban(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    parts = message.text.split(maxsplit=1)
+    if len(parts) != 2 or not parts[1].isdigit():
+        await message.answer("Использование: /unban ID")
+        return
+    target = int(parts[1])
+    cursor.execute("DELETE FROM banned_users WHERE user_id = ?", (target,))
+    db.commit()
+    await message.answer(f"✅ Пользователь {target} разблокирован.")
+
+
 @dp.message(F.text == "/admin")
 async def admin_panel(message: Message):
     if not is_admin(message.from_user.id):
@@ -771,7 +998,7 @@ async def admin_panel(message: Message):
     )
 
 
-@dp.message(F.text == "👁 Все активные диалоги")
+@dp.message(F.text.in_(["👁 Все активные диалоги", "👁 Активные диалоги"]))
 async def admin_active_dialogs(message: Message):
     if not is_admin(message.from_user.id):
         return
@@ -794,15 +1021,20 @@ async def admin_active_dialogs(message: Message):
     )
 
     for session_id, (user_id, partner_id) in unique.items():
-        await send_session_to_admin(
+        shown = await send_session_to_admin(
             session_id,
             title=f"🟢 АКТИВНЫЙ ДИАЛОГ\n👥 {user_id} ↔ {partner_id}"
         )
+        if not shown:
+            await bot.send_message(
+                ADMIN_ID,
+                f"🟢 Активный диалог {user_id} ↔ {partner_id}: сообщений пока нет."
+            )
 
     await message.answer("✅ Все активные диалоги показаны.", reply_markup=admin_keyboard)
 
 
-@dp.message(F.text == "🗂 Все сохранённые диалоги")
+@dp.message(F.text.in_(["🗂 Все сохранённые диалоги", "🗂 Сохранённые диалоги"]))
 async def admin_all_dialogs(message: Message):
     if not is_admin(message.from_user.id):
         return
@@ -827,10 +1059,122 @@ async def admin_all_dialogs(message: Message):
     await message.answer("✅ Все сохранённые диалоги показаны.", reply_markup=admin_keyboard)
 
 
+@dp.message(F.text == "📊 Статистика бота")
+async def admin_stats(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+
+    cursor.execute("SELECT COUNT(*) FROM users")
+    total = cursor.fetchone()[0]
+    cursor.execute("SELECT COUNT(*) FROM users WHERE searching = 1")
+    searching = cursor.fetchone()[0]
+    cursor.execute("SELECT COUNT(*) FROM users WHERE partner_id IS NOT NULL")
+    active_users = cursor.fetchone()[0] // 2
+    cursor.execute("SELECT COUNT(*) FROM banned_users")
+    banned = cursor.fetchone()[0]
+    cursor.execute("SELECT COUNT(*) FROM reports")
+    reports = cursor.fetchone()[0]
+    cursor.execute("SELECT COUNT(*) FROM chat_messages")
+    messages = cursor.fetchone()[0]
+
+    await message.answer(
+        "📊 Статистика бота\n\n"
+        f"👤 Пользователей: {total}\n"
+        f"🔎 Ищут собеседника: {searching}\n"
+        f"💬 Активных диалогов: {active_users}\n"
+        f"💬 Сохранённых сообщений: {messages}\n"
+        f"🚨 Жалоб: {reports}\n"
+        f"🔨 Заблокированных: {banned}",
+        reply_markup=admin_keyboard
+    )
+
+
+@dp.message(F.text == "📢 Рассылка")
+async def admin_broadcast(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    admin_broadcast_mode.add(message.from_user.id)
+    await message.answer(
+        "📢 Режим рассылки включён.\n\n"
+        "Отправь следующим сообщением текст, фото, видео или другой контент — "
+        "я разошлю его всем пользователям.\n\n"
+        "Для отмены нажми «🔙 Выйти из админки»."
+    )
+
+
+@dp.message(F.text == "🔨 Бан / разбан")
+async def admin_ban_help(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    await message.answer(
+        "🔨 Управление банами\n\n"
+        "/ban ID причина — заблокировать пользователя\n"
+        "/unban ID — снять блокировку\n\n"
+        "Например: /ban 123456 спам"
+    )
+
+
+@dp.message(F.text == "👥 Пользователи")
+async def admin_users(message: Message):
+    if not is_admin(message.from_user.id): return
+    await message.answer("👥 Пользователи\n\n🔎 Просмотр: /user ID\n🔨 Бан: /ban ID причина\n✅ Разбан: /unban ID")
+
+@dp.message(F.text.startswith("/user "))
+async def admin_user_info(message: Message):
+    if not is_admin(message.from_user.id): return
+    parts = message.text.split(maxsplit=1)
+    if len(parts) != 2 or not parts[1].isdigit():
+        await message.answer("Использование: /user ID"); return
+    target = int(parts[1]); user = get_user(target)
+    if not user:
+        await message.answer("❌ Пользователь не найден в базе."); return
+    cursor.execute("SELECT COUNT(*) FROM reports WHERE target_id = ?", (target,)); reports = cursor.fetchone()[0]
+    cursor.execute("SELECT AVG(rating), COUNT(*) FROM ratings WHERE rated_id = ?", (target,)); avg, count = cursor.fetchone()
+    rating = f"{avg:.1f}/5 ({count})" if avg is not None else "нет оценок"
+    await message.answer("👤 Пользователь\n\n" + f"🆔 ID: {target}\n🎂 Возраст: {user[1] or 'не указан'}\n🚻 Пол: {user[2] or 'не указан'}\n💬 Разговоров: {user[6]}\n🔎 Ищет: {'да' if user[3] else 'нет'}\n🟢 В диалоге: {'да' if user[4] else 'нет'}\n🚨 Жалоб на него: {reports}\n⭐ Рейтинг: {rating}\n🔨 Заблокирован: {'да' if is_banned(target) else 'нет'}")
+
+@dp.message(F.text == "🚨 Жалобы")
+async def admin_reports(message: Message):
+    if not is_admin(message.from_user.id): return
+    cursor.execute("SELECT id, reporter_id, target_id, created_at FROM reports ORDER BY id DESC LIMIT 20")
+    rows = cursor.fetchall()
+    if not rows:
+        await message.answer("🚨 Жалоб пока нет.", reply_markup=admin_keyboard); return
+    text = "🚨 Последние 20 жалоб:\n\n" + "\n".join(f"#{r[0]} | {r[1]} → {r[2]} | {r[3]}" for r in rows) + "\n\n📖 Историю: /report ID"
+    await message.answer(text, reply_markup=admin_keyboard)
+
+@dp.message(F.text.startswith("/report "))
+async def admin_report_view(message: Message):
+    if not is_admin(message.from_user.id): return
+    parts=message.text.split(maxsplit=1)
+    if len(parts)!=2 or not parts[1].isdigit():
+        await message.answer("Использование: /report ID_жалобы"); return
+    rid=int(parts[1])
+    cursor.execute("SELECT reporter_id, target_id, session_id, created_at FROM reports WHERE id = ?", (rid,)); row=cursor.fetchone()
+    if not row:
+        await message.answer("❌ Жалоба не найдена."); return
+    reporter,target,session_id,created=row
+    await message.answer(f"🚨 Жалоба #{rid}\n👤 От: {reporter}\n🎯 На: {target}\n📅 {created}")
+    if session_id: await send_session_to_admin(session_id, title=f"🚨 ИСТОРИЯ ЖАЛОБЫ #{rid}")
+
+@dp.message(F.text == "💾 Бэкап сейчас")
+async def admin_backup_now(message: Message):
+    if not is_admin(message.from_user.id): return
+    try:
+        backup_database(); await message.answer("💾 Бэкап базы создан. Хранятся последние 7 копий.", reply_markup=admin_keyboard)
+    except Exception as e: await message.answer(f"❌ Ошибка бэкапа: {e}", reply_markup=admin_keyboard)
+
+@dp.message(F.text == "⚙️ Режим техработ")
+async def admin_maintenance(message: Message):
+    if not is_admin(message.from_user.id): return
+    value="0" if maintenance_enabled() else "1"; set_setting("maintenance", value)
+    await message.answer(f"⚙️ Режим технических работ {'включён 🔴' if value=='1' else 'выключен 🟢'}.", reply_markup=admin_keyboard)
+
 @dp.message(F.text == "🔙 Выйти из админки")
 async def admin_exit(message: Message):
     if not is_admin(message.from_user.id):
         return
+    admin_broadcast_mode.discard(message.from_user.id)
     await message.answer("🔙 Вышел из админ-панели.", reply_markup=main_keyboard)
 
 
@@ -841,6 +1185,9 @@ async def admin_exit(message: Message):
 @dp.message(CommandStart())
 async def start(message: Message):
     user_id = message.from_user.id
+    if is_banned(user_id):
+        await message.answer("🚫 Доступ к боту ограничен.")
+        return
 
     create_user(user_id)
 
@@ -873,11 +1220,125 @@ async def start(message: Message):
 @dp.message(F.text == "☰ Меню")
 async def menu(message: Message):
     user_id = message.from_user.id
+    maintenance_text = maintenance_message(user_id)
+    if maintenance_text:
+        await message.answer(maintenance_text)
+        return
+    if is_banned(user_id):
+        await message.answer("🚫 Доступ к боту ограничен.")
+        return
     await message.answer(
         "☰ Меню\n\n"
         "Здесь можно посмотреть профиль, статистику и изменить настройки.",
         reply_markup=menu_keyboard_for(user_id)
     )
+
+
+@dp.message(F.text == "🚫 Чёрный список")
+async def blacklist_menu(message: Message):
+    user_id = message.from_user.id
+    if is_banned(user_id):
+        await message.answer("🚫 Доступ к боту ограничен.")
+        return
+    blocked = get_blocked_users(user_id)
+    if not blocked:
+        await message.answer(
+            "🚫 Чёрный список пуст.",
+            reply_markup=menu_keyboard_for(user_id)
+        )
+        return
+    await message.answer(
+        "🚫 Заблокированные пользователи:\n\n" +
+        "\n".join(f"• {uid}" for uid in blocked),
+        reply_markup=blacklist_keyboard(blocked)
+    )
+
+
+@dp.callback_query(F.data.startswith("unblock|"))
+async def unblock_user(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    try:
+        target = int(callback.data.split("|", 1)[1])
+    except (ValueError, IndexError):
+        await callback.answer("Ошибка", show_alert=True)
+        return
+    remove_block(user_id, target)
+    await callback.answer("Пользователь разблокирован")
+    blocked = get_blocked_users(user_id)
+    await callback.message.edit_text(
+        "🚫 Чёрный список пуст." if not blocked else
+        "🚫 Заблокированные пользователи:\n\n" + "\n".join(f"• {uid}" for uid in blocked),
+        reply_markup=blacklist_keyboard(blocked)
+    )
+
+
+@dp.callback_query(F.data.startswith("block|"))
+async def block_partner(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    try:
+        target = int(callback.data.split("|", 1)[1])
+    except (ValueError, IndexError):
+        await callback.answer("Ошибка", show_alert=True)
+        return
+    if target == user_id:
+        await callback.answer("Нельзя заблокировать себя", show_alert=True)
+        return
+    user = get_user(user_id)
+    target_user = get_user(target)
+    if not target_user:
+        await callback.answer("Пользователь не найден", show_alert=True)
+        return
+    if not user or user[4] != target:
+        await callback.answer("Можно блокировать только текущего собеседника", show_alert=True)
+        return
+    add_block(user_id, target)
+    if user and user[4] == target:
+        await close_current_chat(user_id, "🚫 Собеседник завершил диалог.")
+    await callback.answer("Собеседник заблокирован")
+    await callback.message.answer(
+        "🚫 Пользователь заблокирован. Он больше не попадётся тебе в поиске.",
+        reply_markup=main_keyboard
+    )
+
+
+@dp.callback_query(F.data.startswith("rate|"))
+async def rate_partner(callback: CallbackQuery):
+    try:
+        _, rating, session_id, partner_id = callback.data.split("|", 3)
+        rating = int(rating)
+        partner_id = int(partner_id)
+    except (ValueError, IndexError):
+        await callback.answer("Ошибка", show_alert=True)
+        return
+    user_id = callback.from_user.id
+    if rating < 1 or rating > 5:
+        await callback.answer("Ошибка", show_alert=True)
+        return
+    cursor.execute(
+        "SELECT 1 FROM chat_messages WHERE session_id = ? AND sender_id = ? LIMIT 1",
+        (session_id, user_id)
+    )
+    participated = cursor.fetchone() is not None
+    if not participated:
+        await callback.answer("Эта оценка недействительна", show_alert=True)
+        return
+    cursor.execute(
+        "SELECT 1 FROM chat_messages WHERE session_id = ? AND sender_id = ? LIMIT 1",
+        (session_id, partner_id)
+    )
+    if cursor.fetchone() is None:
+        await callback.answer("Собеседник не найден в этой сессии", show_alert=True)
+        return
+    cursor.execute(
+        "INSERT OR IGNORE INTO ratings (session_id, rater_id, rated_id, rating) VALUES (?, ?, ?, ?)",
+        (session_id, user_id, partner_id, rating)
+    )
+    db.commit()
+    await callback.answer("Спасибо за оценку ⭐")
+    try:
+        await callback.message.edit_text("⭐ Оценка сохранена. Спасибо!")
+    except Exception:
+        pass
 
 
 @dp.message(F.text == "👤 Мой профиль")
@@ -903,10 +1364,15 @@ async def partner_profile(message: Message):
         )
         return
 
+    partner_id = user[4]
+    block_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🚫 Заблокировать собеседника", callback_data=f"block|{partner_id}")]
+    ])
     await message.answer(
-        partner_info_text(user[4]),
-        reply_markup=menu_keyboard_for(user_id)
+        partner_info_text(partner_id),
+        reply_markup=block_keyboard
     )
+    await message.answer("Меню", reply_markup=menu_keyboard_for(user_id))
 
 
 @dp.message(F.text == "📊 Моя статистика")
@@ -1042,7 +1508,11 @@ async def menu_back(message: Message):
     "26–30"
 ]))
 async def choose_age(message: Message):
-    create_user(message.from_user.id)
+    user_id = message.from_user.id
+    if is_banned(user_id):
+        await message.answer("🚫 Доступ к боту ограничен.")
+        return
+    create_user(user_id)
     current = get_user(message.from_user.id)
 
     if current and current[4]:
@@ -1076,7 +1546,11 @@ async def choose_age(message: Message):
     "🤷 Неважно"
 ]))
 async def choose_gender(message: Message):
-    create_user(message.from_user.id)
+    user_id = message.from_user.id
+    if is_banned(user_id):
+        await message.answer("🚫 Доступ к боту ограничен.")
+        return
+    create_user(user_id)
     current = get_user(message.from_user.id)
 
     if current and current[4]:
@@ -1105,6 +1579,10 @@ async def choose_gender(message: Message):
 
 @dp.message(F.text == "🔎 Найти собеседника")
 async def search(message: Message):
+    maintenance_text = maintenance_message(message.from_user.id)
+    if maintenance_text:
+        await message.answer(maintenance_text)
+        return
     user = get_user(message.from_user.id)
 
     if not user or not user[1] or not user[2]:
@@ -1135,6 +1613,10 @@ async def search(message: Message):
 ]))
 async def choose_search_gender(message: Message):
     user_id = message.from_user.id
+    maintenance_text = maintenance_message(user_id)
+    if maintenance_text:
+        await message.answer(maintenance_text)
+        return
     user = get_user(user_id)
 
     if not user or not user[1] or not user[2]:
@@ -1172,7 +1654,11 @@ async def next_partner(message: Message):
         return
 
     if user[4]:
+        partner_id = user[4]
+        session_id = user[9]
         await close_current_chat(user_id)
+        await send_rating_request(user_id, partner_id, session_id)
+        await send_rating_request(partner_id, user_id, session_id)
 
     await message.answer("➡️ Ищу нового собеседника...")
     await find_partner(message)
@@ -1189,7 +1675,12 @@ async def stop(message: Message):
     if not user:
         return
 
+    partner_id = user[4]
+    session_id = user[9]
     await close_current_chat(user_id)
+    if partner_id and session_id:
+        await send_rating_request(user_id, partner_id, session_id)
+        await send_rating_request(partner_id, user_id, session_id)
 
     await message.answer(
         "🛑 Диалог завершён.",
@@ -1218,6 +1709,12 @@ async def report(message: Message):
         return
 
     session_id = user[9]
+
+    cursor.execute(
+        "INSERT INTO reports (reporter_id, target_id, session_id) VALUES (?, ?, ?)",
+        (user_id, partner_id, session_id)
+    )
+    db.commit()
 
     if ADMIN_ID:
         try:
@@ -1292,6 +1789,13 @@ async def offer_contact_exchange(user_id: int, partner_id: int):
 @dp.message(F.contact)
 async def contact(message: Message):
     user_id = message.from_user.id
+    maintenance_text = maintenance_message(user_id)
+    if maintenance_text:
+        await message.answer(maintenance_text)
+        return
+    if is_banned(user_id):
+        await message.answer("🚫 Доступ к боту ограничен.")
+        return
     user = get_user(user_id)
 
     if not user or not user[4]:
@@ -1304,6 +1808,14 @@ async def contact(message: Message):
         await message.answer(
             "❌ Обмен номерами доступен только после "
             "10 сообщений от каждого."
+        )
+        return
+
+    # Telegram может прислать user_id контакта. Если он известен,
+    # разрешаем отправлять только собственный номер пользователя.
+    if message.contact.user_id is not None and message.contact.user_id != user_id:
+        await message.answer(
+            "❌ Можно отправить только свой номер телефона."
         )
         return
 
@@ -1329,9 +1841,43 @@ async def contact(message: Message):
 @dp.message()
 async def relay_message(message: Message):
     user_id = message.from_user.id
+
+    if user_id in admin_broadcast_mode and is_admin(user_id):
+        admin_broadcast_mode.discard(user_id)
+        cursor.execute("SELECT user_id FROM users")
+        recipients = [row[0] for row in cursor.fetchall() if row[0] != ADMIN_ID and not is_banned(row[0])]
+        sent = 0
+        failed = 0
+        for recipient in recipients:
+            try:
+                await bot.copy_message(
+                    chat_id=recipient,
+                    from_chat_id=message.chat.id,
+                    message_id=message.message_id
+                )
+                sent += 1
+                await asyncio.sleep(0.04)
+            except Exception:
+                failed += 1
+        await bot.send_message(ADMIN_ID, f"📢 Рассылка завершена.\n✅ Отправлено: {sent}\n❌ Ошибок: {failed}", reply_markup=admin_keyboard)
+        return
+
+    maintenance_text = maintenance_message(user_id)
+    if maintenance_text:
+        await message.answer(maintenance_text)
+        return
+
     user = get_user(user_id)
 
     if not user:
+        return
+
+    if is_banned(user_id):
+        await message.answer("🚫 Доступ к боту ограничен.")
+        return
+
+    if not anti_spam_ok(user_id):
+        await message.answer("🛡 Слишком много сообщений. Подожди несколько секунд.")
         return
 
     partner_id = user[4]
@@ -1412,12 +1958,55 @@ async def relay_message(message: Message):
 
 
 # =========================================================
+# АВТОМАТИЧЕСКИЕ БЭКАПЫ
+# =========================================================
+
+def backup_database():
+    os.makedirs("backups", exist_ok=True)
+    stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    path = os.path.join("backups", f"bot_{stamp}.db")
+    backup_conn = sqlite3.connect(path)
+    try:
+        db.backup(backup_conn)
+    finally:
+        backup_conn.close()
+
+    files = sorted(
+        [os.path.join("backups", name) for name in os.listdir("backups") if name.endswith(".db")],
+        key=os.path.getmtime,
+        reverse=True
+    )
+    for old in files[7:]:
+        try:
+            os.remove(old)
+        except OSError:
+            pass
+
+
+async def backup_loop():
+    while True:
+        try:
+            backup_database()
+        except Exception as e:
+            print("Ошибка автоматического бэкапа:", e)
+        await asyncio.sleep(24 * 60 * 60)
+
+
+# =========================================================
 # ЗАПУСК
 # =========================================================
 
 async def main():
     print("🤖 Бот запущен.")
-    await dp.start_polling(bot)
+    backup_task = asyncio.create_task(backup_loop())
+    try:
+        await dp.start_polling(bot)
+    finally:
+        backup_task.cancel()
+        try:
+            await backup_task
+        except asyncio.CancelledError:
+            pass
 
 if __name__ == "__main__":
     try:
